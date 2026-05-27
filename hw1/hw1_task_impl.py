@@ -12,8 +12,7 @@ import torch
 
 def lowest_ai_fn(x: torch.Tensor) -> torch.Tensor:
     """Lowest arithmetic intensity baseline (0 FLOP/Byte)."""
-    # TODO (1 line): implement a lowest-AI op
-    pass
+    return x.clone()
 
 
 # TASK 1b: Implement a function with configurable arithmetic intensity.
@@ -37,10 +36,12 @@ def make_compute_fn(num_ops: int, compiled: bool = True):
     """Return an eager or compiled function whose work scales with num_ops."""
 
     def fn(x: torch.Tensor) -> torch.Tensor:
-        pass
+        acc = x
+        for _ in range(num_ops):
+            acc = acc * x + x
+        return acc
 
-    # TODO (1 line): return either `fn` or `torch.compile(fn)` based on `compiled`
-    pass
+    return torch.compile(fn) if compiled else fn
 
 
 # ============================================================================
@@ -62,8 +63,23 @@ def benchmark_fn(fn, *args, warmup=25, rep=100) -> float:
         fn(*args)
     torch.cuda.synchronize()
 
-    # TODO: time `rep` runs using CUDA events and return median latency (ms)
-    pass
+    times_ms = []
+    for _ in range(rep):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+
+        start.record()
+        fn(*args)
+        end.record()
+
+        end.synchronize()
+        times_ms.append(start.elapsed_time(end))
+
+    times_ms.sort()
+    mid = len(times_ms) // 2
+    if len(times_ms) % 2 == 1:
+        return times_ms[mid]
+    return 0.5 * (times_ms[mid - 1] + times_ms[mid])
 
 
 # TASK 3: Compute element-wise operation metrics from measured runtime.
@@ -83,8 +99,17 @@ def benchmark_fn(fn, *args, warmup=25, rep=100) -> float:
 
 
 def compute_elementwise_metrics(num_elements, num_ops, bytes_per_element, ms, variant):
-    # TODO: compute total FLOPs, arithmetic intensity, and achieved FLOP/s
-    pass
+    total_flops = num_elements * num_ops * 2
+
+    if variant == "compiled":
+        total_bytes = num_elements * 2 * bytes_per_element
+    elif variant == "eager":
+        total_bytes = num_elements * num_ops * 6 * bytes_per_element
+    else:
+        raise ValueError(f"Unknown variant: {variant}")
+
+    ai = total_flops / total_bytes
+    achieved_flops = total_flops / (ms * 1e-3)
     return total_flops, ai, achieved_flops
 
 
@@ -96,13 +121,29 @@ def compute_elementwise_metrics(num_elements, num_ops, bytes_per_element, ms, va
 # Q1. Look at the compiled element-wise operations from `1 ops` through `64 ops`.
 # Why does performance rise as arithmetic intensity increases even though the
 # measured runtime changes only a little?
+# A1. The compiled kernels are fused, so the tensor is still read and written
+# once at the kernel boundary while each element does more FMA work. Runtime
+# stays dominated by roughly the same memory traffic for small-to-medium K, but
+# the FLOP count rises with K, so achieved FLOP/s rises.
 #
 # Q2. In one sample run, `matmul 1024x1024` achieved lower FLOP/s than the
 # `128 ops` compiled element-wise operation. Give one or two reasons why that can
 # happen on a large GPU like an H100.
+# A2. A 1024x1024 GEMM may be too small to fully occupy a large GPU and can pay
+# proportionally more scheduling/library overhead. The element-wise kernel has a
+# very large vector, simple control flow, and enough independent per-element work
+# to expose parallelism even though it is much less sophisticated than GEMM.
 #
 # Q3. Between `64 ops` and `128 ops`, runtime increases more noticeably than it
 # did for smaller operations. What does that suggest about what resource is
 # becoming the bottleneck?
+# A3. It suggests the kernel is moving away from the memory-bandwidth-limited
+# region and becoming limited by arithmetic throughput, instruction issue, or
+# register pressure from the longer fused expression.
 #
 # Q4. Why do the eager `ops-K` points look so different from the compiled ones?
+# A4. Eager PyTorch launches separate multiply and add kernels in each loop
+# iteration and materializes intermediates in global memory. That repeatedly
+# reads and writes the tensor data, so traffic grows with K and the effective
+# arithmetic intensity stays low. The compiled version can fuse the loop body,
+# keeping intermediates in registers and increasing AI as K grows.
